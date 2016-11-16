@@ -11,7 +11,7 @@ from django.core.exceptions import ImproperlyConfigured
 from ratelimit import ALL, UNSAFE
 
 
-__all__ = ['is_ratelimited']
+__all__ = ['is_ratelimited', 'get_usage_count', 'reset_usage_count']
 
 _PERIODS = {
     's': 1,
@@ -81,6 +81,24 @@ def _get_window(value, period):
         return w + period
     return w
 
+def _build_value(group, key, request):
+    if callable(key):
+        value = key(group, request)
+    elif key in _SIMPLE_KEYS:
+        value = _SIMPLE_KEYS[key](request)
+    elif ':' in key:
+        accessor, k = key.split(':', 1)
+        if accessor not in _ACCESSOR_KEYS:
+            raise ImproperlyConfigured('Unknown ratelimit key: %s' % key)
+        value = _ACCESSOR_KEYS[accessor](request, k)
+    elif '.' in key:
+        mod, attr = key.rsplit('.', 1)
+        keyfn = getattr(import_module(mod), attr)
+        value = keyfn(group, request)
+    else:
+        raise ImproperlyConfigured(
+            'Could not understand ratelimit key: %s' % key)
+    return value
 
 def _make_cache_key(group, rate, value, methods):
     count, period = _split_rate(rate)
@@ -136,24 +154,8 @@ def get_usage_count(request, group=None, fn=None, key=None, rate=None,
     limit, period = _split_rate(rate)
     cache_name = getattr(settings, 'RATELIMIT_USE_CACHE', 'default')
     cache = caches[cache_name]
-
-    if callable(key):
-        value = key(group, request)
-    elif key in _SIMPLE_KEYS:
-        value = _SIMPLE_KEYS[key](request)
-    elif ':' in key:
-        accessor, k = key.split(':', 1)
-        if accessor not in _ACCESSOR_KEYS:
-            raise ImproperlyConfigured('Unknown ratelimit key: %s' % key)
-        value = _ACCESSOR_KEYS[accessor](request, k)
-    elif '.' in key:
-        mod, attr = key.rsplit('.', 1)
-        keyfn = getattr(import_module(mod), attr)
-        value = keyfn(group, request)
-    else:
-        raise ImproperlyConfigured(
-            'Could not understand ratelimit key: %s' % key)
-
+    
+    value = _build_value(group, key, request)
     cache_key = _make_cache_key(group, rate, value, method)
     time_left = _get_window(value, period) - int(time.time())
     initial_value = 1 if increment else 0
@@ -169,6 +171,20 @@ def get_usage_count(request, group=None, fn=None, key=None, rate=None,
         else:
             count = cache.get(cache_key, initial_value)
     return {'count': count, 'limit': limit, 'time_left': time_left}
+
+
+def reset_usage_count(request, group=None, key=None, rate=None, method=ALL):
+    if not key:
+        raise ImproperlyConfigured('Ratelimit key must be specified')
+    if not group:
+        raise ImproperlyConfigured('Group key must be specified')
+
+    cache_name = getattr(settings, 'RATELIMIT_USE_CACHE', 'default')
+    cache = caches[cache_name]
+    value = _build_value(group, key, request)
+    cache_key = _make_cache_key(group, rate, value, method)
+    cache.delete(cache_key)
+
 
 is_ratelimited.ALL = ALL
 is_ratelimited.UNSAFE = UNSAFE
